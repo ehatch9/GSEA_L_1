@@ -1,0 +1,203 @@
+---
+title: "Mps1i signature analysis"
+author: "Emily Hatch"
+date: "2023-07-28"
+output: html_document
+---
+
+### Goal
+Generate a gene set from Mps1i DEGs and determine whether this signature is enriched in the MN+/- and MN i/r datasets using gsea (which takes into account the relative significance/strength of the genes in the DEG analysis resutls, hypergeometeric enrichment treats all genes as equal).
+
+```{r setup}
+knitr::opts_chunk$set(cache = TRUE, echo = TRUE, warning = FALSE, message = FALSE, error = FALSE, fig_width = 4, fig_height = 6, fig_retina = TRUE, keep_md = TRUE, dev = c("png", "pdf")) 
+```
+### Load dependencies
+fgsea contains a package to perform gsea analysis 
+```{r, results = 'hide'}
+library(tidyverse)
+library(kableExtra)
+library(readxl)
+#install.packages("powerjoin")
+library(powerjoin)
+
+library(BiocManager)
+# BiocManager::install("fgsea")
+library(fgsea)
+library(DESeq2)
+```
+### Import Lucian's RNAseq results mapped to genes
+Sources: hatchlab/Lucian/Paper/supplementary/DEGs.xlsx
+hatchlab/Lucian/Paper/data/de_mn.RData
+hatchlab/Lucian/Paper/data/de_rupture.RData
+
+The DEGs spreadsheet contains all of the annotated genes in the RNAseq analyses. I think it is the same as "res_shrunk_df_reduced" in each of the data files, but I haven't checked. 
+
+Import DEG lists for Mps1i, MN, and Rupture. Filter each to exclude ENSG labels that don't map to an entrez gene label (ext_gene = NA) (pseudogenes and ncRNAs, although some pseudogenes are annotated) and to limit analysis to genes that were found to be differentiall expressed. Differential expression is defined as p-adj <= 0.05.
+
+There are different opinions about how to deal with multiple ENSG ids mapping to the same entrez gene. Since each ENSG is a different sequence, and therefore a different gene locus (often they map to alternative sequences for the same gene), I've decided to keep all ENSG IDs separate and use them as the gene designators. 
+
+```{r, results = 'hide'}
+Mps1i_DEG <- read_excel("DEGs.xlsx", sheet = "Mps1i")
+MN_DEG <- read_excel("DEGs.xlsx", sheet = "MN")
+Rupture_DEG <- read_excel("DEGs.xlsx", sheet = "Rupture")
+
+Mps1i_DEG_f <- Mps1i_DEG %>%
+  filter(ext_gene != "" & padj <= 0.05)
+
+MN_DEG_f <- MN_DEG %>%
+  filter(ext_gene != "" & padj <= 0.05)
+
+Rupture_DEG_f <- Rupture_DEG %>%
+  filter(ext_gene != "" & padj <= 0.05)
+```
+Define gene set of interest by filtering Mps1i list for genes that increase more than 1.5 fold. For gsea analysis, upregulated and downregulated gene lists must be analyzed separately.  Since only 4 genes are downregulated in the Mps1i list, and one of those is a pseudogene, I'm skipping that list.
+``` {r}
+Mps1i_DEG_FC_1pt5 <- Mps1i_DEG_f %>%
+  filter(log2FoldChange >= log2(1.5))
+
+Mps1_list <- c(list(Mps1i = Mps1i_DEG_FC_1pt5$ens_gene))
+
+write_csv(Mps1i_DEG_FC_1pt5, "Mps1i_DEG_FC_1pt5.csv")
+```
+### Rank gene lists by "stat" (Wald test statistic, sim. to z-score)
+
+Generate ranked list of MNi/r and MN+/- aggregated results. From the internet - use stat (log2FC/IfcSE) to rank genes (automatically ordered). Lucian used fold-change (arranged in descending order). These data were not included in the DEG lists so I imported the full DeSeq2 data (dds data) from the experiment objects and extracted the results including the stat column from the DESeq2 data. Then I merged these data into the DEGs data. 
+
+To merge two dataframes and keep only unique columns I used the power_join function from the powerjoin library. 
+```{r}
+load("de_mn.RData")
+dds_mn <- de_mn$dds
+results_mn <- data.frame(results(dds_mn)) %>%
+  rownames_to_column("ens_gene")
+MN_complete <- power_left_join(MN_DEG_f, results_mn, by = "ens_gene", conflict = coalesce_xy)
+
+load("de_rupture.RData")
+dds_rupt <- de_rupture$dds
+results_rupt <- data.frame(results(dds_rupt)) %>%
+  rownames_to_column("ens_gene")
+Rupt_complete <- power_left_join(Rupture_DEG_f, results_rupt, by = "ens_gene", conflict = coalesce_xy)
+
+write_csv(MN_complete, "MN_complete_stat.csv")
+write_csv(Rupt_complete, "Rupt_complete_stat.csv")
+```
+Format the MN and rupture DEGs for input into the fgsea package. Keep just the ens_gene and stat columns and convert the two column dataframe to a named numerical vector using deframe(). fgsea will order gene ids by the stat value (ascending, highest value = most different) automatically.
+```{r}
+rank_data_MN_stat <- MN_complete %>%
+  select(ens_gene, stat) %>%
+  deframe()
+
+rank_data_rupt_stat <- Rupt_complete %>%
+  select(ens_gene, stat) %>%
+  deframe()
+```
+Conduct gsea analyses. 
+```{r}
+fgsea_MN_stat <- fgsea(pathways = Mps1_list,
+                       stats = rank_data_MN_stat,
+                       minSize = 5,
+                       maxSize = 2500,
+                       scoreType = "pos")
+
+fgsea_rupt_stat <- fgsea(pathways = Mps1_list,
+                       stats = rank_data_rupt_stat,
+                       minSize = 5,
+                       maxSize = 2500,
+                       scoreType = "pos")
+
+write_csv(fgsea_MN_stat, "fgsea_MN_Mps1i.csv")
+write_csv(fgsea_rupt_stat, "fgsea_rupt_Mps1i.csv")
+
+# to check that you used the same gene identifiers in both lists
+# length(intersect(names(rank_data_MN), unlist(Mps1i_pathway)))
+```
+### Add Mps1i to hallmark pathway list in gsea analysis to provide context for significance values.
+Using split(): divides data in vector or dataframe (x) into groups defined by (f). f is often a list of factors (i.e a vector).
+```{r, results = 'hide'}
+# install.packages("msigdbr")
+library(msigdbr)
+
+collections <- msigdbr::msigdbr_collections()
+pathwaysH <- msigdbr(species = "Homo sapiens",
+                    category = "H")
+pathwaysH_list <- split(x = pathwaysH$ensembl_gene, f = pathwaysH$gs_name)
+
+pathwaysH_Mps1_list <- c(list(Mps1i = Mps1i_DEG_FC_1pt5$ens_gene), pathwaysH_list)
+
+fgsea_rupt_H_stat <- fgsea(pathways = pathwaysH_Mps1_list,
+                       stats = rank_data_rupt_stat,
+                       minSize = 5,
+                       maxSize = 2500,
+                       scoreType = "pos",
+                       nproc = 1)
+
+fgsea_MN_H_stat <- fgsea(pathways = pathwaysH_Mps1_list,
+                       stats = rank_data_MN_stat,
+                       minSize = 5,
+                       maxSize = 2500,
+                       scoreType = "pos",
+                       nproc = 1)
+
+write_csv(fgsea_MN_H_stat, "fgsea_MN_Mps1i+H.csv")
+write_csv(fgsea_rupt_H_stat, "fgsea_rupt_Mps1i+H.csv")
+```
+### Plot enrichments - bar graph
+```{r}
+library(ggplot2)
+
+rupture_plot_1 <- ggplot(fgsea_rupt_H_stat, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+print(rupture_plot_1)
+```
+
+```{r}
+MN_plot_1 <- ggplot(fgsea_MN_H_stat, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+print(MN_plot_1)
+```
+
+### Plot enrichments - running score
+``` {r}
+rupt_plot_2 <- plotEnrichment(pathwaysH_Mps1_list[["Mps1i"]],
+               rank_data_rupt_stat) + labs(title="Mps1i vs MNi/r")
+print(rupt_plot_2)
+```
+
+```{r}
+MN_plot_2 <- plotEnrichment(pathwaysH_Mps1_list[["Mps1i"]],
+               rank_data_MN_stat) + labs(title="Mps1i vs MN+/-")
+print(MN_plot_2)
+```
+### List of leading edge genes for Mps1i pathway for MN and rupt gene lists. 
+
+```{r}
+
+le_rupt <- as.data.frame(fgsea_rupt_H_stat$leadingEdge[[12]], nm = "ens_gene") %>%
+  power_left_join(Mps1i_DEG_FC_1pt5) %>%
+  select(ens_gene, ext_gene) %>%
+  arrange(ext_gene)
+
+le_MN <- as.data.frame(fgsea_MN_H_stat$leadingEdge[[13]], nm = "ens_gene") %>%
+  power_left_join(Mps1i_DEG_FC_1pt5) %>%
+  select(ens_gene, ext_gene) %>%
+  arrange(ext_gene)
+```
+```{r, echo = FALSE}
+kable(le_MN, align = "cc", caption = "<center><strong>MN+/- leading edge genes Mps1i pathway<center><strong>") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r, echo = FALSE}
+kable(le_rupt, align = "cc", caption = "<center><strong>MNi/r leading edge genes Mps1i pathway<center><strong>") %>%
+  kable_styling(full_width = FALSE)
+```
+
